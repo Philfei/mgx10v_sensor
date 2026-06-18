@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sensor Control</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Sensor Control</h1>
+        <p id="paths">Loading paths...</p>
+      </div>
+      <button id="refreshBtn" class="secondary">Refresh</button>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="section-head">
+          <h2>Programs</h2>
+          <span id="diskInfo" class="muted"></span>
+        </div>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-dot" id="sensorDataDot"></span>
+            <div>
+              <strong>sensor_data</strong>
+              <small id="sensorDataStatus">unknown</small>
+            </div>
+          </div>
+          <div class="status-item">
+            <span class="status-dot" id="gvinsDot"></span>
+            <div>
+              <strong>ic_gvins_zmq</strong>
+              <small id="gvinsStatus">unknown</small>
+            </div>
+          </div>
+          <div class="status-item">
+            <span class="status-dot" id="recorderDot"></span>
+            <div>
+              <strong>sensor_recorder</strong>
+              <small id="recorderStatus">unknown</small>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="start-toggle" data-toggle="sensor_data" data-action="start_sensor_data">Start sensor_data</button>
+          <button class="start-toggle" data-toggle="ic_gvins_zmq" data-action="start_ic_gvins_zmq">Start ic_gvins_zmq</button>
+          <button class="start-toggle" data-toggle="sensor_recorder" data-action="start_sensor_recorder">Start recorder</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Recorded Data</h2>
+          <span id="datasetCount" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Modified</th>
+                <th>Size</th>
+                <th>Sensors</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="datasetRows">
+              <tr><td colspan="5" class="empty">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Output</h2>
+          <div class="log-buttons">
+            <button class="secondary log-btn" data-log="recorder">Recorder Log</button>
+            <button class="secondary log-btn" data-log="ic_gvins">GVINS Log</button>
+            <button class="secondary log-btn" data-log="sensor_data">Camera Log</button>
+            <button class="secondary log-btn" data-log="imu">IMU Log</button>
+            <button class="secondary log-btn" data-log="gnss">GNSS Log</button>
+          </div>
+        </div>
+        <pre id="output">Ready.</pre>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

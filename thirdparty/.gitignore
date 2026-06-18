@@ -1,0 +1,17 @@
+_build/
+src/*
+!src/.gitkeep
+install/*
+!install/.gitkeep
+!install/README.md
+debs/*
+!debs/.gitkeep
+!debs/README.md
+rockchip/*
+!rockchip/README.md
+!rockchip/aarch64-linux-gnu/
+rockchip/aarch64-linux-gnu/*
+!rockchip/aarch64-linux-gnu/README.md
+!rockchip/aarch64-linux-gnu/lib/
+rockchip/aarch64-linux-gnu/lib/*
+!rockchip/aarch64-linux-gnu/lib/README.md

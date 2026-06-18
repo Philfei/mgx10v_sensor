@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package mgx10v.proto;
+import "Common.proto";
+
+message GnssMsg {
+
+    message GPSTime {
+        int32 week = 1;
+        double tow = 2;
+    }
+
+    GPSTime time = 1;
+    int32 pos_type = 2;         // 4: NARROW_INT
+    repeated double blh = 3;    // 纬度 经度 高程（大地高）
+    repeated double blh_std = 4;// blh标准差
+    repeated double vel = 5;    // 输入enu（东北天）的速度
+
+    int32 pos_sol_status = 6;   // 0: SOL_COMPUTED
+    double diff_age = 7;        // <5s //差分龄期
+    double sol_age = 8;         // 0s // 解的龄期
+    int32 solnSVs = 9;          // 在解中使用的卫星数
+    Header header = 10;         // 消息头
+    repeated double blh_cov = 11; // 位置协方差
+    float hrms = 12;            // 水平精度
+    float vrms = 13;            // 垂直精度
+    float hdop = 14;            // 水平精度因子
+    float vdop = 15;            // 垂直精度因子
+}

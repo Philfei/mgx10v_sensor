@@ -1,0 +1,24 @@
+data_root: /userdata/app/sensor_recorder/data
+chunk_duration_s: 5
+
+topics:
+  - name: cam_left
+    type: raw_image
+    endpoint: ipc:///tmp/cam_left
+    topic: cam_left_topic
+    enabled: true
+  - name: cam_right
+    type: raw_image
+    endpoint: ipc:///tmp/cam_right
+    topic: cam_right_topic
+    enabled: true
+  - name: imu
+    type: imu
+    endpoint: ipc:///tmp/imu_data
+    topic: imu_topic
+    enabled: true
+  - name: gnss
+    type: gnss
+    endpoint: ipc:///tmp/gnss_data
+    topic: gnss_topic
+    enabled: true

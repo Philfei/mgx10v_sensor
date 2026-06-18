@@ -1,0 +1,5 @@
+gap_thresholds:
+  cam_left: 0.07
+  cam_right: 0.07
+  imu: 0.011
+  gnss: 0.11

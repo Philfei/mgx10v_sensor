@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package mgx10v.proto;
+import "google/protobuf/timestamp.proto";
+
+message Quaternion {
+    double x = 1;
+    double y = 2;
+    double z = 3;
+    double w = 4;
+}
+
+message Vector3 {
+    double x = 1;
+    double y = 2;
+    double z = 3;
+}
+
+message Header {
+    google.protobuf.Timestamp stamp = 1;
+    string frame_id = 2;
+}
+
+// 定义点云中单个点的结构,含有x,y,z,intensity
+message PointI {
+    float x = 1;
+    float y = 2;
+    float z = 3;
+    float intensity = 4;
+}
