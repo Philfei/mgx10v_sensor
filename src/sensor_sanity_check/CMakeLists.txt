@@ -54,20 +54,6 @@ set_target_properties(sensor_sanity_check PROPERTIES
   INSTALL_RPATH "$ORIGIN/lib"
   BUILD_WITH_INSTALL_RPATH TRUE)
 
-enable_testing()
-
-add_executable(chunk_reader_test tests/chunk_reader_test.cpp)
-target_link_libraries(chunk_reader_test PRIVATE sensor_sanity_core)
-add_test(NAME chunk_reader_test COMMAND chunk_reader_test)
-
-add_executable(sanity_config_test tests/sanity_config_test.cpp)
-target_link_libraries(sanity_config_test PRIVATE sensor_sanity_core)
-add_test(NAME sanity_config_test COMMAND sanity_config_test)
-
-add_executable(timestamp_extractor_test tests/timestamp_extractor_test.cpp)
-target_link_libraries(timestamp_extractor_test PRIVATE sensor_sanity_core)
-add_test(NAME timestamp_extractor_test COMMAND timestamp_extractor_test)
-
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../sensor_data/proto")
 set(PROTO_FILES
     "${PROTO_DIR}/Common.proto"

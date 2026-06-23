@@ -16,6 +16,7 @@ struct Frame {
   uint32_t colorspace = 0;
   uint32_t ycbcr_enc = 0;
   uint32_t quantization = 0;
+  int exposure_us = 0;
   std::vector<uint8_t> data;
 };
 

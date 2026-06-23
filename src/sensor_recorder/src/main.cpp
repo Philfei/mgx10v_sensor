@@ -4,7 +4,6 @@
 #include "recorder_config.h"
 #include "receiver_runtime.h"
 #include "record_writer.h"
-#include "shared_image_reader.h"
 
 #include <google/protobuf/timestamp.pb.h>
 #include <zmq.hpp>
@@ -41,7 +40,6 @@ struct TopicStats {
   uint64_t saved = 0;
   uint64_t parse_fail = 0;
   uint64_t missing_raw = 0;
-  uint64_t shm_overwrite = 0;
 };
 
 void on_signal(int) {
@@ -158,8 +156,8 @@ std::string message_to_string(const zmq::message_t& message) {
 
 bool process_raw_image(const TopicConfig& topic, const zmq::message_t& payload,
                        const zmq::message_t& raw_payload,
-                       bool has_raw_payload, SharedImageReader* shm_reader,
-                       RecordWriter* writer, TopicStats* stats) {
+                       bool has_raw_payload, RecordWriter* writer,
+                       TopicStats* stats) {
   mgx10v::proto::RawImage msg;
   if (!msg.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
     ++stats->parse_fail;
@@ -171,17 +169,6 @@ bool process_raw_image(const TopicConfig& topic, const zmq::message_t& payload,
     raw = message_to_string(raw_payload);
   } else if (!msg.data().empty()) {
     raw = msg.data();
-  } else if (!msg.shm_name().empty()) {
-    std::vector<uint8_t> copied;
-    bool overwritten = false;
-    if (shm_reader->copy_image(msg, &copied, &overwritten)) {
-      raw.assign(reinterpret_cast<const char*>(copied.data()), copied.size());
-    } else {
-      if (overwritten) {
-        ++stats->shm_overwrite;
-      }
-      ++stats->missing_raw;
-    }
   } else {
     ++stats->missing_raw;
   }
@@ -231,14 +218,12 @@ void log_status(const TopicConfig& topic, const TopicStats& stats,
             << " saved=" << stats.saved << " hz=" << std::fixed
             << std::setprecision(2) << hz
             << " parse_fail=" << stats.parse_fail
-            << " missing_raw=" << stats.missing_raw
-            << " shm_overwrite=" << stats.shm_overwrite << std::endl;
+            << " missing_raw=" << stats.missing_raw << std::endl;
 }
 
 void receive_topic(const ReceiverRuntime runtime, RecordWriter* writer,
                    bool quiet) {
   const TopicConfig& topic = runtime.topic;
-  SharedImageReader shm_reader;
   TopicStats stats;
 
   try {
@@ -279,7 +264,7 @@ void receive_topic(const ReceiverRuntime runtime, RecordWriter* writer,
       switch (topic.type) {
         case TopicType::RawImage:
           process_raw_image(topic, payload, raw_payload, has_raw_payload,
-                            &shm_reader, writer, &stats);
+                            writer, &stats);
           break;
         case TopicType::Imu:
           process_imu(topic, payload, writer, &stats);
@@ -308,8 +293,7 @@ void receive_topic(const ReceiverRuntime runtime, RecordWriter* writer,
     std::lock_guard<std::mutex> lock(g_log_mutex);
     std::cout << "stopped " << topic.name << " saved=" << stats.saved
               << " parse_fail=" << stats.parse_fail
-              << " missing_raw=" << stats.missing_raw
-              << " shm_overwrite=" << stats.shm_overwrite << std::endl;
+              << " missing_raw=" << stats.missing_raw << std::endl;
   }
 }
 

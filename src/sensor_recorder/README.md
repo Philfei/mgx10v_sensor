@@ -56,10 +56,7 @@ raw_payload_bytes
 ```
 
 For IMU and GNSS, `raw_payload_size` is `0`. For camera streams, raw ZMQ
-multipart image bytes are saved directly. If the camera publisher uses shared
-memory transport, the recorder copies the image bytes from POSIX shared memory
-at receive time and stores that copy in the chunk, so the saved data can be
-decoded offline after the publisher exits.
+multipart image bytes are saved directly.
 
 ## Build
 

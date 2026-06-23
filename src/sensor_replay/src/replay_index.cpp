@@ -180,6 +180,7 @@ std::vector<ReplayEvent> load_replay_events(
       continue;
     }
     for (const auto& file_path : collect_chunks(dataset_dir / topic.name)) {
+      const uint64_t file_size = std::filesystem::file_size(file_path);
       std::ifstream in(file_path, std::ios::binary);
       if (!in.is_open()) {
         throw std::runtime_error("cannot open chunk: " + file_path.string());
@@ -205,20 +206,34 @@ std::vector<ReplayEvent> load_replay_events(
           in.read(reinterpret_cast<char*>(header.data()),
                   static_cast<std::streamsize>(header.size()));
           if (!in) {
-            throw std::runtime_error("incomplete header in " +
-                                     file_path.string());
+            if (in.eof()) break;
+            throw std::runtime_error("incomplete header in " + file_path.string());
           }
         }
         uint32_t raw_size = 0;
         if (!read_u32_le(in, &raw_size)) {
+          if (in.eof()) break;
           throw std::runtime_error("missing raw size in " + file_path.string());
         }
         if (raw_size > kMaxRawSize) {
           throw std::runtime_error("raw payload too large in " +
                                    file_path.string());
         }
-        const uint64_t raw_offset = static_cast<uint64_t>(in.tellg());
+        const auto raw_offset_pos = in.tellg();
+        if (raw_offset_pos < 0) {
+          throw std::runtime_error("cannot locate raw payload in " +
+                                   file_path.string());
+        }
+        const uint64_t raw_offset = static_cast<uint64_t>(raw_offset_pos);
+        if (raw_offset + raw_size > file_size) {
+          break;
+        }
         auto timestamp = extract_timestamp_ns(header, topic.kind);
+        in.seekg(static_cast<std::streamoff>(raw_size), std::ios::cur);
+        if (!in) {
+          throw std::runtime_error("incomplete raw payload in " +
+                                   file_path.string());
+        }
         if (timestamp.has_value()) {
           events.push_back({*timestamp,
                             topic.name,
@@ -229,11 +244,6 @@ std::vector<ReplayEvent> load_replay_events(
                             std::move(header),
                             raw_offset,
                             raw_size});
-        }
-        in.seekg(static_cast<std::streamoff>(raw_size), std::ios::cur);
-        if (!in) {
-          throw std::runtime_error("incomplete raw payload in " +
-                                   file_path.string());
         }
       }
     }

@@ -9,7 +9,7 @@ if [[ ! -x "${APP}" ]]; then
   exit 1
 fi
 
-OUTPUT_PATH="${OUTPUT_PATH:-/root/sensor_receiver/snapshot}"
+OUTPUT_PATH="${OUTPUT_PATH:-/userdata/app/img_imu_collect/saved}"
 IMAGE_PUB="${IMAGE_PUB:-tcp://*:5560}"
 CONTROL="${CONTROL:-tcp://*:5561}"
 OUT_W="${OUT_W:-1280}"

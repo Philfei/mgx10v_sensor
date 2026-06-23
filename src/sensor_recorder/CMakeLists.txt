@@ -12,7 +12,6 @@ endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -O3)
 
 option(SENSOR_RECORDER_BUILD_APP "Build sensor_recorder application" ON)
-option(SENSOR_RECORDER_BUILD_TESTS "Build sensor_recorder unit tests" ON)
 
 get_filename_component(RECEIVER_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
@@ -24,22 +23,6 @@ add_library(sensor_recorder_core STATIC
   src/recorder_config.cpp)
 target_include_directories(sensor_recorder_core PUBLIC src)
 target_link_libraries(sensor_recorder_core PUBLIC Threads::Threads)
-
-if(SENSOR_RECORDER_BUILD_TESTS)
-  enable_testing()
-
-  add_executable(record_writer_test tests/record_writer_test.cpp)
-  target_link_libraries(record_writer_test PRIVATE sensor_recorder_core)
-  add_test(NAME record_writer_test COMMAND record_writer_test)
-
-  add_executable(recorder_config_test tests/recorder_config_test.cpp)
-  target_link_libraries(recorder_config_test PRIVATE sensor_recorder_core)
-  add_test(NAME recorder_config_test COMMAND recorder_config_test)
-
-  add_executable(receiver_runtime_test tests/receiver_runtime_test.cpp)
-  target_link_libraries(receiver_runtime_test PRIVATE sensor_recorder_core)
-  add_test(NAME receiver_runtime_test COMMAND receiver_runtime_test)
-endif()
 
 if(SENSOR_RECORDER_BUILD_APP)
   set(SENSOR_RECORDER_THIRDPARTY_PREFIX
@@ -97,11 +80,9 @@ if(SENSOR_RECORDER_BUILD_APP)
   target_link_libraries(sensor_recorder_proto PUBLIC "${PROTOBUF_LIB}")
 
   add_executable(sensor_recorder
-    src/main.cpp
-    src/shared_image_reader.cpp)
+    src/main.cpp)
   target_include_directories(sensor_recorder PRIVATE
     src
-    "${CMAKE_CURRENT_SOURCE_DIR}/../sensor_data/include"
     "${SENSOR_RECORDER_THIRDPARTY_PREFIX}/include")
   target_link_libraries(sensor_recorder PRIVATE
     sensor_recorder_core

@@ -6,11 +6,12 @@ package mgx10v.proto;
 
 // A raw image
 message RawImage {
+  reserved 7, 8, 9, 10, 11, 12, 13;
+  reserved "frame_id", "shm_name", "shm_offset", "data_size", "sequence",
+           "shm_slot", "shm_slot_count";
+
   // Timestamp of image
   google.protobuf.Timestamp timestamp = 1;
-
-  // Frame of reference for the image. The origin of the frame is the optical center of the camera. +x points to the right in the image, +y points down, and +z points into the plane of the image.
-  string frame_id = 7;
 
   // Image width
   fixed32 width = 2;
@@ -27,23 +28,10 @@ message RawImage {
   // Byte length of a single row
   fixed32 step = 5;
 
-  // Legacy inline raw image data. Current high-rate camera transport may send
-  // image bytes through shared memory and leave this field empty.
+  // Legacy inline raw image data. Current high-rate camera transport sends
+  // image bytes as a ZMQ multipart raw payload and leaves this field empty.
   bytes data = 6;
 
-  // POSIX shared memory object name, for example "/mgx10v_cam_left".
-  string shm_name = 8;
-
-  // Byte offset of the image payload inside shm_name.
-  fixed64 shm_offset = 9;
-
-  // Number of valid image bytes in shared memory or raw payload.
-  fixed64 data_size = 10;
-
-  // Monotonic publisher sequence used to detect overwritten shared slots.
-  fixed64 sequence = 11;
-
-  // Shared memory ring slot index and slot count for diagnostics.
-  fixed32 shm_slot = 12;
-  fixed32 shm_slot_count = 13;
+  // Camera exposure time in microseconds.
+  fixed32 exposure_us = 14;
 }

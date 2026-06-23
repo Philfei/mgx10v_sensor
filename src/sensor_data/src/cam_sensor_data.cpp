@@ -1,11 +1,10 @@
 #include "bounded_frame_queue.h"
-#include "camera_timestamp_assignment.h"
+#include "exposure_timestamp.h"
 #include "types.h"
 #include "zmq_publisher.h"
 
 #include "RawImageMsg.pb.h"
 
-#include <im2d.h>
 #include <linux/videodev2.h>
 #include <rk_aiq_user_api2_sysctl.h>
 #include <rk_defines.h>
@@ -66,37 +65,7 @@ struct Args {
   int duration_s = 0;
   bool aiq = true;
   std::string iq_dir = "/etc/iqfiles/";
-  std::string color_format = "bgr8";
 };
-
-struct ColorFormatInfo {
-  const char* encoding = "bgr8";
-  int channels = 3;
-  int rga_format = RK_FORMAT_BGR_888;
-};
-
-std::string lower_copy(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return s;
-}
-
-bool parse_color_format(const std::string& value, ColorFormatInfo* out) {
-  if (!out) return false;
-  const std::string v = lower_copy(value);
-  if (v == "bgr8") {
-    *out = ColorFormatInfo{};
-    return true;
-  }
-  if (v == "bgra8") {
-    out->encoding = "bgra8";
-    out->channels = 4;
-    out->rga_format = RK_FORMAT_BGRA_8888;
-    return true;
-  }
-  return false;
-}
 
 void on_signal(int) {
   g_run.store(false);
@@ -120,7 +89,7 @@ void usage(const char* app) {
       "  --right-endpoint <ipc://>  default ipc:///tmp/cam_right\n"
       "  --left-topic <topic>       default cam_left_topic\n"
       "  --right-topic <topic>      default cam_right_topic\n"
-      "  --color-format <bgr8|bgra8> RGA output format (default bgr8)\n",
+      "  (publishes raw NV12: encoding=nv12, step=width, data=w*h*3/2)\n",
       app);
 }
 
@@ -151,7 +120,6 @@ bool parse_args(int argc, char** argv, Args& args) {
     else if (key == "--right-endpoint") args.right_endpoint = next();
     else if (key == "--left-topic") args.left_topic = next();
     else if (key == "--right-topic") args.right_topic = next();
-    else if (key == "--color-format") args.color_format = next();
     else if (key == "-h" || key == "--help") {
       usage(argv[0]);
       return false;
@@ -371,8 +339,8 @@ class CapturedFrame {
 public:
   CapturedFrame() = default;
   CapturedFrame(int dev, const VIDEO_FRAME_INFO_S& frame, ns_t timestamp_ns,
-                uint64_t pts_us, int exposure_us)
-      : dev_(dev), frame_(frame), timestamp_ns_(timestamp_ns), pts_us_(pts_us),
+                int exposure_us)
+      : dev_(dev), frame_(frame), timestamp_ns_(timestamp_ns),
         exposure_us_(exposure_us), valid_(true) {}
   ~CapturedFrame() { release(); }
   CapturedFrame(const CapturedFrame&) = delete;
@@ -392,7 +360,6 @@ public:
 
   bool valid() const { return valid_; }
   ns_t timestamp_ns() const { return timestamp_ns_; }
-  uint64_t pts_us() const { return pts_us_; }
   int exposure_us() const { return exposure_us_; }
   const VIDEO_FRAME_INFO_S& frame() const { return frame_; }
 
@@ -407,7 +374,6 @@ private:
     dev_ = other.dev_;
     frame_ = other.frame_;
     timestamp_ns_ = other.timestamp_ns_;
-    pts_us_ = other.pts_us_;
     exposure_us_ = other.exposure_us_;
     valid_ = other.valid_;
     other.valid_ = false;
@@ -416,7 +382,6 @@ private:
   int dev_ = -1;
   VIDEO_FRAME_INFO_S frame_{};
   ns_t timestamp_ns_ = 0;
-  uint64_t pts_us_ = 0;
   int exposure_us_ = 0;
   bool valid_ = false;
 };
@@ -658,13 +623,10 @@ private:
       if (ret != RK_SUCCESS) continue;
 
       const ns_t trigger_timestamp_ns = read_frame_timestamp_ns();
-      const uint64_t pts_us = video_frame.stVFrame.u64PTS;
       const SensorExposure exposure = exposure_reader_.read(dev);
-      const ns_t timestamp_ns = assign_camera_mid_exposure_timestamp_ns(
-          timestamp_trackers_[dev], pts_us, trigger_timestamp_ns,
-          exposure.exposure_us);
-      CapturedFrame frame(dev, video_frame, timestamp_ns, pts_us,
-                          exposure.exposure_us);
+      const ns_t timestamp_ns = exposure_midpoint_timestamp_ns(
+          trigger_timestamp_ns, exposure.exposure_us);
+      CapturedFrame frame(dev, video_frame, timestamp_ns, exposure.exposure_us);
       if (callbacks_[dev]) {
         callbacks_[dev](std::move(frame));
       }
@@ -685,14 +647,6 @@ private:
   std::thread threads_[kCameraCount];
   FrameCallback callbacks_[kCameraCount];
   SensorExposureReader exposure_reader_;
-  FrameTimestampTracker timestamp_trackers_[kCameraCount];
-};
-
-struct ConvertedImage {
-  const uint8_t* data = nullptr;
-  size_t size = 0;
-  const char* encoding = "bgr8";
-  uint32_t step = 0;
 };
 
 std::shared_ptr<Frame> copy_captured_frame(const CapturedFrame& captured) {
@@ -713,6 +667,7 @@ std::shared_ptr<Frame> copy_captured_frame(const CapturedFrame& captured) {
   frame->stride = w;
   frame->pixfmt = kPixFmtNV12;
   frame->ts_ns = captured.timestamp_ns();
+  frame->exposure_us = captured.exposure_us();
   frame->data.resize(static_cast<size_t>(w) * h * 3 / 2);
 
   const uint8_t* src_y = static_cast<const uint8_t*>(vir_addr);
@@ -731,106 +686,30 @@ std::shared_ptr<Frame> copy_captured_frame(const CapturedFrame& captured) {
   return frame;
 }
 
-class RgaColorConverter {
-public:
-  explicit RgaColorConverter(ColorFormatInfo format) : format_(format) {}
-
-  bool convert(const Frame& frame, ConvertedImage* image) {
-    if (!image || frame.width <= 0 || frame.height <= 0 ||
-        frame.data.empty()) {
-      return false;
-    }
-    *image = ConvertedImage{};
-    image->encoding = format_.encoding;
-
-    const size_t expected_nv12 =
-        static_cast<size_t>(frame.width) * frame.height * 3 / 2;
-    if (frame.data.size() < expected_nv12) return false;
-
-    const size_t expected_color =
-        static_cast<size_t>(frame.width) * frame.height * format_.channels;
-    if (!ensure_output(frame.width, frame.height, expected_color)) {
-      return false;
-    }
-
-    rga_buffer_t src = wrapbuffer_virtualaddr(
-        const_cast<uint8_t*>(frame.data.data()), frame.width, frame.height,
-        RK_FORMAT_YCbCr_420_SP);
-    rga_buffer_t dst = wrapbuffer_virtualaddr(color_.data(), frame.width,
-                                              frame.height,
-                                              format_.rga_format);
-
-    IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP,
-                                  format_.rga_format,
-                                  IM_YUV_TO_RGB_BT601_FULL, 1);
-    if (status != IM_STATUS_SUCCESS) {
-      static std::atomic<unsigned int> log_count{0};
-      unsigned int n = log_count.fetch_add(1);
-      if (n < 5 || n % 100 == 0) {
-        std::fprintf(stderr, "rga imcvtcolor failed: %s (%d)\n",
-                     imStrError(status), static_cast<int>(status));
-      }
-      return false;
-    }
-
-    image->data = color_.data();
-    image->size = expected_color;
-    image->step = static_cast<uint32_t>(frame.width * format_.channels);
-    return true;
-  }
-
-private:
-  bool ensure_output(int width, int height, size_t size) {
-    if (width == dst_width_ && height == dst_height_ && size == dst_size_ &&
-        dst_ready_) {
-      return true;
-    }
-
-    dst_width_ = width;
-    dst_height_ = height;
-    dst_size_ = size;
-    color_.assign(size, 0);
-    dst_ready_ = true;
-    return true;
-  }
-
-  ColorFormatInfo format_;
-  std::vector<uint8_t> color_;
-  int dst_width_ = 0;
-  int dst_height_ = 0;
-  size_t dst_size_ = 0;
-  bool dst_ready_ = false;
-};
 
 uint64_t elapsed_us_since(std::chrono::steady_clock::time_point start);
 
-void fill_image_header(const Frame& frame, const ConvertedImage& image,
-                       const std::string& frame_id,
-                       mgx10v::proto::RawImage* msg) {
-  msg->Clear();
-  set_timestamp_from_ns(msg->mutable_timestamp(), frame.ts_ns);
-  msg->set_frame_id(frame_id);
-  msg->set_width(static_cast<uint32_t>(frame.width));
-  msg->set_height(static_cast<uint32_t>(frame.height));
-  msg->set_encoding(image.encoding);
-  msg->set_step(image.step);
-  msg->set_data_size(static_cast<uint64_t>(image.step) * frame.height);
-}
-
-bool publish_color_image(ZmqPublisher& pub, const Frame& frame,
-                         const ConvertedImage& image,
-                         const std::string& frame_id) {
-  if (!image.data || frame.width <= 0 || frame.height <= 0 ||
-      image.step == 0) {
-    return false;
-  }
-  const size_t expected = static_cast<size_t>(image.step) * frame.height;
-  if (image.size < expected) return false;
+// Publish the captured frame as raw NV12 (the native ISP format): no RGA color
+// conversion, no JPEG encoding. Payload is the packed NV12 buffer (w*h*3/2).
+bool publish_nv12_image(ZmqPublisher& pub, const Frame& frame,
+                        const std::string& frame_id) {
+  if (frame.width <= 0 || frame.height <= 0 || frame.data.empty()) return false;
+  const size_t expected =
+      static_cast<size_t>(frame.width) * frame.height * 3 / 2;
+  if (frame.data.size() < expected) return false;
 
   mgx10v::proto::RawImage msg;
-  fill_image_header(frame, image, frame_id, &msg);
+  msg.Clear();
+  set_timestamp_from_ns(msg.mutable_timestamp(), frame.ts_ns);
+  msg.set_frame_id(frame_id);
+  msg.set_width(static_cast<uint32_t>(frame.width));
+  msg.set_height(static_cast<uint32_t>(frame.height));
+  msg.set_encoding("nv12");
+  msg.set_step(static_cast<uint32_t>(frame.width));  // Y-plane row stride
+  msg.set_data_size(static_cast<uint64_t>(expected));
+  msg.set_exposure_us(static_cast<uint32_t>(std::max(frame.exposure_us, 0)));
 
-  return pub.publish_with_raw_payload(msg, image.data, expected);
+  return pub.publish_with_raw_payload(msg, frame.data.data(), expected);
 }
 
 double fps_from_count(unsigned long long count, double elapsed_s) {
@@ -854,12 +733,6 @@ void update_max(std::atomic<uint64_t>& value, uint64_t sample) {
 int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args)) return 1;
-  ColorFormatInfo color_format;
-  if (!parse_color_format(args.color_format, &color_format)) {
-    std::fprintf(stderr, "unsupported --color-format: %s\n",
-                 args.color_format.c_str());
-    return 1;
-  }
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
@@ -888,12 +761,7 @@ int main(int argc, char** argv) {
   std::atomic<unsigned long long> right_count{0};
   std::atomic<unsigned long long> decode_fail_count{0};
   std::atomic<unsigned long long> publish_fail_count{0};
-  std::atomic<unsigned long long> rga_success_count{0};
-  std::atomic<unsigned long long> rga_fail_count{0};
-  std::atomic<uint64_t> rga_total_us{0};
-  std::atomic<uint64_t> rga_interval_us{0};
-  std::atomic<uint64_t> rga_max_us{0};
-  std::atomic<uint64_t> rga_last_us{0};
+  std::atomic<unsigned long long> published_count{0};
   std::atomic<uint64_t> publish_total_us{0};
   std::atomic<uint64_t> publish_interval_us{0};
   std::atomic<uint64_t> publish_max_us{0};
@@ -902,10 +770,8 @@ int main(int argc, char** argv) {
   std::atomic<int> right_last_exposure_us{0};
   BoundedFrameQueue<CapturedFrame> left_queue(kPublishQueueDepth);
   BoundedFrameQueue<CapturedFrame> right_queue(kPublishQueueDepth);
-  RgaColorConverter left_converter(color_format);
-  RgaColorConverter right_converter(color_format);
 
-  auto handle_frame = [&](std::shared_ptr<Frame> frame, RgaColorConverter& converter,
+  auto handle_frame = [&](std::shared_ptr<Frame> frame,
                           ZmqPublisher& publisher,
                           const std::string& frame_id,
                           std::atomic<unsigned long long>& frame_count) {
@@ -913,22 +779,11 @@ int main(int argc, char** argv) {
       ++decode_fail_count;
       return;
     }
-    ConvertedImage image;
-    auto convert_start = std::chrono::steady_clock::now();
-    if (!converter.convert(*frame, &image)) {
-      ++rga_fail_count;
-      return;
-    }
-    uint64_t convert_us = elapsed_us_since(convert_start);
-    ++rga_success_count;
-    rga_total_us.fetch_add(convert_us);
-    rga_interval_us.fetch_add(convert_us);
-    rga_last_us.store(convert_us);
-    update_max(rga_max_us, convert_us);
 
     auto publish_start = std::chrono::steady_clock::now();
-    bool published = publish_color_image(publisher, *frame, image, frame_id);
+    bool published = publish_nv12_image(publisher, *frame, frame_id);
     uint64_t publish_us = elapsed_us_since(publish_start);
+    ++published_count;
     publish_total_us.fetch_add(publish_us);
     publish_interval_us.fetch_add(publish_us);
     publish_last_us.store(publish_us);
@@ -942,7 +797,6 @@ int main(int argc, char** argv) {
   };
 
   auto publish_loop = [&](BoundedFrameQueue<CapturedFrame>& queue,
-                          RgaColorConverter& converter,
                           ZmqPublisher& publisher,
                           const std::string& frame_id,
                           std::atomic<unsigned long long>& frame_count) {
@@ -954,18 +808,15 @@ int main(int argc, char** argv) {
         ++decode_fail_count;
         continue;
       }
-      handle_frame(std::move(frame), converter, publisher, frame_id,
-                   frame_count);
+      handle_frame(std::move(frame), publisher, frame_id, frame_count);
     }
   };
 
   std::thread left_publish_thread([&] {
-    publish_loop(left_queue, left_converter, left_pub, args.left_frame_id,
-                 left_count);
+    publish_loop(left_queue, left_pub, args.left_frame_id, left_count);
   });
   std::thread right_publish_thread([&] {
-    publish_loop(right_queue, right_converter, right_pub, args.right_frame_id,
-                 right_count);
+    publish_loop(right_queue, right_pub, args.right_frame_id, right_count);
   });
 
   if (!capture.start([&](CapturedFrame frame) {
@@ -992,8 +843,7 @@ int main(int argc, char** argv) {
   std::printf("  requested MPI capture: %dx%d fps %d rkaiq=%s left_dev=%d right_dev=%d\n",
               args.width, args.height, args.fps, args.aiq ? "on" : "off",
               capture.left_dev(), capture.right_dev());
-  std::printf("  RGA output: %s\n", color_format.encoding);
-  std::printf("  image transport: raw\n");
+  std::printf("  image transport: raw NV12 (encoding=nv12, no RGA/JPEG)\n");
   std::printf("  actual capture: L=%dx%d R=%dx%d\n",
               capture.width(), capture.height(), capture.width(),
               capture.height());
@@ -1002,13 +852,14 @@ int main(int argc, char** argv) {
               capture.line_time_us(capture.left_dev()),
               capture.subdev_path(capture.right_dev()).c_str(),
               capture.line_time_us(capture.right_dev()));
-  std::printf("  timestamp: cam_sync anchor + frame PTS delta + exposure_us/2\n");
+  std::printf("  timestamp: cam_sync trigger + exposure_us/2 "
+              "(CLOCK_MONOTONIC fallback)\n");
 
   auto start = std::chrono::steady_clock::now();
   auto last = start;
   unsigned long long last_left = 0;
   unsigned long long last_right = 0;
-  unsigned long long last_rga_success = 0;
+  unsigned long long last_published = 0;
   uint64_t last_left_queue_drop = 0;
   uint64_t last_right_queue_drop = 0;
   while (g_run.load()) {
@@ -1025,38 +876,26 @@ int main(int argc, char** argv) {
       double elapsed_s = std::chrono::duration<double>(now - start).count();
       unsigned long long left = left_count.load();
       unsigned long long right = right_count.load();
-      unsigned long long rga_success = rga_success_count.load();
-      unsigned long long rga_interval_count = rga_success - last_rga_success;
+      unsigned long long published = published_count.load();
+      unsigned long long pub_interval_count = published - last_published;
       uint64_t left_queue_drop = left_queue.dropped_count();
       uint64_t right_queue_drop = right_queue.dropped_count();
-      uint64_t interval_us = rga_interval_us.exchange(0);
-      double rga_cur_ms = rga_interval_count > 0
-                              ? interval_us / 1000.0 / rga_interval_count
-                              : 0.0;
-      double rga_avg_ms = rga_success > 0
-                              ? rga_total_us.load() / 1000.0 / rga_success
-                              : 0.0;
       uint64_t publish_interval = publish_interval_us.exchange(0);
       double publish_cur_ms =
-          rga_interval_count > 0
-              ? publish_interval / 1000.0 / rga_interval_count
+          pub_interval_count > 0
+              ? publish_interval / 1000.0 / pub_interval_count
               : 0.0;
       double publish_avg_ms =
-          rga_success > 0
-              ? publish_total_us.load() / 1000.0 / rga_success
-              : 0.0;
+          published > 0 ? publish_total_us.load() / 1000.0 / published : 0.0;
       std::printf("[stat] L=%llu cur=%.2f avg=%.2f fps R=%llu cur=%.2f "
-                  "avg=%.2f fps rga=%llu rga_ms cur_avg=%.3f avg=%.3f "
-                  "max=%.3f last=%.3f publish_ms cur_avg=%.3f avg=%.3f "
-                  "max=%.3f last=%.3f queue_drop L=%llu(+%llu) "
-                  "R=%llu(+%llu) exposure_us L=%d R=%d rga_fail=%llu "
-                  "decode_fail=%llu publish_fail=%llu\n",
+                  "avg=%.2f fps frames=%llu publish_ms cur_avg=%.3f avg=%.3f "
+                  "max=%.3f last=%.3f queue_drop L=%llu(+%llu) R=%llu(+%llu) "
+                  "exposure_us L=%d R=%d decode_fail=%llu publish_fail=%llu\n",
                   left, fps_from_count(left - last_left, interval_s),
                   fps_from_count(left, elapsed_s), right,
                   fps_from_count(right - last_right, interval_s),
-                  fps_from_count(right, elapsed_s), rga_success,
-                  rga_cur_ms, rga_avg_ms, rga_max_us.load() / 1000.0,
-                  rga_last_us.load() / 1000.0, publish_cur_ms, publish_avg_ms,
+                  fps_from_count(right, elapsed_s), published,
+                  publish_cur_ms, publish_avg_ms,
                   publish_max_us.load() / 1000.0,
                   publish_last_us.load() / 1000.0,
                   static_cast<unsigned long long>(left_queue_drop),
@@ -1067,14 +906,13 @@ int main(int argc, char** argv) {
                       right_queue_drop - last_right_queue_drop),
                   left_last_exposure_us.load(),
                   right_last_exposure_us.load(),
-                  rga_fail_count.load(),
                   decode_fail_count.load(),
                   publish_fail_count.load());
       std::fflush(stdout);
       last = now;
       last_left = left;
       last_right = right;
-      last_rga_success = rga_success;
+      last_published = published;
       last_left_queue_drop = left_queue_drop;
       last_right_queue_drop = right_queue_drop;
     }
@@ -1085,18 +923,12 @@ int main(int argc, char** argv) {
   right_queue.close();
   if (left_publish_thread.joinable()) left_publish_thread.join();
   if (right_publish_thread.joinable()) right_publish_thread.join();
-  std::printf("done. left=%llu right=%llu rga=%llu rga_fail=%llu "
-              "rga_ms avg=%.3f max=%.3f publish_ms avg=%.3f max=%.3f "
+  std::printf("done. left=%llu right=%llu frames=%llu "
+              "publish_ms avg=%.3f max=%.3f "
               "queue_drop L=%llu R=%llu decode_fail=%llu publish_fail=%llu\n",
-              left_count.load(), right_count.load(), rga_success_count.load(),
-              rga_fail_count.load(),
-              rga_success_count.load() > 0
-                  ? rga_total_us.load() / 1000.0 / rga_success_count.load()
-                  : 0.0,
-              rga_max_us.load() / 1000.0,
-              rga_success_count.load() > 0
-                  ? publish_total_us.load() / 1000.0 /
-                        rga_success_count.load()
+              left_count.load(), right_count.load(), published_count.load(),
+              published_count.load() > 0
+                  ? publish_total_us.load() / 1000.0 / published_count.load()
                   : 0.0,
               publish_max_us.load() / 1000.0,
               static_cast<unsigned long long>(left_queue.dropped_count()),

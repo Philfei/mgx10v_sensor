@@ -27,7 +27,7 @@ part 1: protobuf 序列化后的 bytes
 
 ```text
 part 0: topic 字符串
-part 1: RawImage protobuf header（timestamp/frame_id/width/height/encoding/step）
+part 1: RawImage protobuf header（timestamp/frame_id/width/height/encoding/step/data_size/exposure_us）
 part 2: 原始图像 bytes
 ```
 
@@ -40,12 +40,14 @@ part 2: 原始图像 bytes
 该目录生成 C++ protobuf 代码，构建输出也会复制 `proto/`，便于部署后查看消息
 结构。
 
-`cam_sensor_data` 默认采集 `1920x1080` 原始 `nv12` 数据，在发布前使用
-Rockchip RGA 硬件转换为 `bgr8`，再通过三段 ZMQ 发布。采集端会优先使用
-V4L2 `VIDIOC_EXPBUF` 导出的 DMA-BUF fd 作为 RGA 输入源；若设备不支持导出，
-才回退到 virtual-address buffer。RGA 输出端会优先从 dma-heap 分配 DMA-BUF
-并复用 RGA handle，避免每帧使用目标 virtual-address buffer；如果设备没有可用
-dma-heap，自动回退到 virtual-address 输出。
+`cam_sensor_data` 直接发布相机原生 **NV12**（`encoding="nv12"`，`step=width`，
+payload = 紧凑 NV12 `w*h*3/2` 字节），**不做** RGA 颜色转换、**不做** JPEG 编码——
+sensor_data 端最省 CPU、无损。下游解码即得彩色图：NV12 的 Y 平面就是全分辨率灰度
+（IC-GVINS 等可零拷贝取 Y），`cv2.cvtColor(..., COLOR_YUV2BGR_NV12)` 得 BGR。
+
+`cam_sensor_data` 采集 `nv12`（`RK_FMT_YUV420SP`），把 VPSS 帧按行 stride 紧凑拷贝
+为 `stride=width` 的 NV12 缓冲后,通过三段 ZMQ（topic / RawImage header / 原始 NV12
+payload）发布。带宽较大（1280×720 ≈ 1.35MB/帧），换取无损与零编码开销。
 
 ## 编译
 
@@ -76,8 +78,8 @@ receiver_test/sensor_data_build/
 receiver_test/sensor_data_build/deploy/
 ```
 
-`cam_sensor_data` 使用 Rockchip RGA 做 `nv12 -> bgr8` 硬件颜色转换，然后只负责
-通过 ZMQ 发布原始图像 bytes；本模块不保存图像，也不链接图像编解码或视觉处理库。
+`cam_sensor_data` 直接通过 ZMQ 发布原始 NV12 图像 bytes（不做颜色转换/编码）；
+本模块不保存图像，也不链接图像编解码或视觉处理库。
 
 ## 部署
 
@@ -156,11 +158,9 @@ rmmod cam_sync
 MPI 实际捕获到的左右目尺寸。需要指定其他分辨率时使用 `--w <n> --h <n>`。
 默认发布 `bgr8`；需要对比 RGA 32bit 对齐输出时可使用 `--color-format bgra8`。
 统计输出中的 `rga_ms` 为 RGA 同步颜色转换耗时，`publish_ms` 为 ZMQ 发布 raw
-payload 的耗时。相机采集线程会读取 `/dev/cam_sync` 触发时间作为绝对时间锚点，
-后续用 `frame.stVFrame.u64PTS` 的帧间 delta 推进时间戳，避免因读取到最新
-`cam_sync` 触发时间而产生 0.1s 假间隔。再按 sensor subdev 的
-`V4L2_CID_EXPOSURE` 和行时间计算曝光时长，将发布时间戳补偿为曝光中点：
-`cam_sync_anchor + pts_delta + exposure_us / 2`。默认左目曝光 subdev 为
+payload 的耗时。相机采集线程会读取 `/dev/cam_sync` 触发时间，并按 sensor subdev
+的 `V4L2_CID_EXPOSURE` 和行时间计算曝光时长，将发布时间戳补偿为曝光中点：
+`cam_sync_trigger + exposure_us / 2`。默认左目曝光 subdev 为
 `/dev/v4l-subdev10`，右目为 `/dev/v4l-subdev5`，可用 `--left-subdev`、
 `--right-subdev` 覆盖。
 采集线程会在读取时间戳后把 VPSS buffer 交给异步发布队列，`queue_drop`

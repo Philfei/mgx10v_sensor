@@ -3,3 +3,6 @@ build
 build-mgx10v
 .agents
 .codex
+data
+gnss_trajs
+__pycache__

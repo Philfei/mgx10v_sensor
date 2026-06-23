@@ -17,7 +17,9 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -42,6 +44,7 @@ struct Config {
   int jpeg_quality = 80;
   int stat_interval_ms = 1000;
   int duration_sec = 0;
+  int save_count = 30;  // stereo pairs captured per 's' command
   bool quiet = false;
 };
 
@@ -55,7 +58,7 @@ struct DecodeStats {
 };
 
 struct ImageState {
-  cv::Mat latest_bgr;
+  cv::Mat latest_bgr;            // decoded BGR: used for the preview stream and PNG save
   int64_t latest_sec = 0;
   int32_t latest_nsec = 0;
   uint32_t latest_width = 0;
@@ -79,11 +82,27 @@ struct ImuSample {
   double gz = 0.0;
 };
 
-struct SaveJob {
+// A saved stereo pair awaiting the IMU that arrives right after it. Each pair
+// records its arrival-order IMU neighbours: the IMU received just before the
+// image (kept in `before`) and the next IMU to arrive (filled in on arrival).
+struct PendingImu {
   int id = 0;
-  std::chrono::steady_clock::time_point end_time;
-  std::ofstream imu_file;
+  ImuSample before;
+  bool has_before = false;
 };
+
+// One SUB message handed from the receiver thread to the main thread, in the
+// order it arrived off the socket.
+struct QMsg {
+  std::string topic;
+  zmq::message_t payload;
+  zmq::message_t raw;
+  bool has_raw = false;
+};
+
+// Receiver-thread queue cap; drop oldest beyond this if the main thread falls
+// behind. ponytail: fixed cap (~1.8s at 140 msg/s); raise if saves drop frames.
+constexpr size_t kRecvQueueMax = 256;
 
 void on_signal(int) {
   g_run.store(false);
@@ -102,6 +121,22 @@ void add_sample(DecodeStats* stats, double ms) {
   stats->max_ms = std::max(stats->max_ms, ms);
 }
 
+// cam_left/cam_right are hardware-synced at the source (<0.1ms skew), so a small
+// window matches a stereo pair while rejecting adjacent frames (50ms apart at
+// 20fps). Pair by timestamp, never by arrival order.
+constexpr int64_t kStereoPairToleranceNs = 5'000'000;  // 5 ms
+
+int64_t frame_ns(const ImageState& s) {
+  return s.latest_sec * 1000000000LL + s.latest_nsec;
+}
+
+// True when the newest left/right frames are the same capture instant and form a
+// pair newer than the last one saved (guards against re-saving and duplicates).
+bool stereo_pair_ready(int64_t left_ns, int64_t right_ns, int64_t last_saved_ns,
+                       int64_t tol_ns) {
+  return std::llabs(left_ns - right_ns) <= tol_ns && left_ns > last_saved_ns;
+}
+
 void usage(const char* app) {
   std::fprintf(stderr,
       "Usage: %s [opts]\n"
@@ -112,6 +147,7 @@ void usage(const char* app) {
       "  --out-w <n> --out-h <n>        resized output size (default 1280x720)\n"
       "  --jpeg-quality <1..100>        output JPEG quality (default 80)\n"
       "  --duration <sec>               stop after N seconds (0=until Ctrl-C)\n"
+      "  --save-count <n>               stereo pairs saved per 's' command (default 30)\n"
       "  --quiet                        reduce per-event logging\n"
       "  --cam-left-endpoint <ipc://>   default ipc:///tmp/cam_left\n"
       "  --cam-right-endpoint <ipc://>  default ipc:///tmp/cam_right\n"
@@ -158,6 +194,10 @@ bool parse_args(int argc, char** argv, Config* cfg) {
       const char* v = need_value("--duration");
       if (!v) return false;
       cfg->duration_sec = std::atoi(v);
+    } else if (arg == "--save-count") {
+      const char* v = need_value("--save-count");
+      if (!v) return false;
+      cfg->save_count = std::max(1, std::atoi(v));
     } else if (arg == "--quiet") {
       cfg->quiet = true;
     } else if (arg == "--cam-left-endpoint") {
@@ -275,6 +315,14 @@ bool raw_image_to_mat(const mgx10v::proto::RawImage& msg,
     *image = cv::Mat(height, width, CV_8UC1, const_cast<uint8_t*>(data), step);
     return true;
   }
+  if (enc == "nv12" || enc == "nv21") {
+    // Packed YUV420 semi-planar: Y plane (h rows) + interleaved UV (h/2 rows),
+    // all at row stride `step`. View as a single-channel h*3/2 x w buffer.
+    if (!enough(static_cast<size_t>(width), height * 3 / 2)) return false;
+    *image = cv::Mat(height * 3 / 2, width, CV_8UC1,
+                     const_cast<uint8_t*>(data), step);
+    return true;
+  }
   return false;
 }
 
@@ -301,6 +349,14 @@ bool mat_to_bgr(const mgx10v::proto::RawImage& msg, const cv::Mat& image,
     cv::cvtColor(image, *bgr, cv::COLOR_GRAY2BGR);
     return true;
   }
+  if (enc == "nv12") {
+    cv::cvtColor(image, *bgr, cv::COLOR_YUV2BGR_NV12);
+    return true;
+  }
+  if (enc == "nv21") {
+    cv::cvtColor(image, *bgr, cv::COLOR_YUV2BGR_NV21);
+    return true;
+  }
   return false;
 }
 
@@ -321,6 +377,7 @@ std::string json_header(const char* stream_name,
      << "\"nsec\":" << msg.timestamp().nanos() << ","
      << "\"src_width\":" << msg.width() << ","
      << "\"src_height\":" << msg.height() << ","
+     << "\"exposure_us\":" << msg.exposure_us() << ","
      << "\"width\":" << out_width << ","
      << "\"height\":" << out_height << ","
      << "\"encoding\":\"jpg\","
@@ -333,25 +390,45 @@ bool publish_resized_jpeg(zmq::socket_t& pub, const char* stream_name,
                           const mgx10v::proto::RawImage& msg,
                           const cv::Mat& bgr, const Config& cfg,
                           ImageState* state) {
+  // Upstream already sends the target size (currently 1280x720), so only resize
+  // when it actually differs; otherwise encode the frame as-is.
+  const cv::Mat* out = &bgr;
   cv::Mat resized;
-  auto resize_start = std::chrono::steady_clock::now();
-  cv::resize(bgr, resized, cv::Size(cfg.out_width, cfg.out_height), 0.0, 0.0,
-             cv::INTER_AREA);
-  add_sample(&state->resize, ms_since(resize_start));
+  if (bgr.cols != cfg.out_width || bgr.rows != cfg.out_height) {
+    auto resize_start = std::chrono::steady_clock::now();
+    cv::resize(bgr, resized, cv::Size(cfg.out_width, cfg.out_height), 0.0, 0.0,
+               cv::INTER_AREA);
+    add_sample(&state->resize, ms_since(resize_start));
+    out = &resized;
+  }
 
   std::vector<uint8_t> encoded;
   std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, cfg.jpeg_quality};
   auto encode_start = std::chrono::steady_clock::now();
-  if (!cv::imencode(".jpg", resized, encoded, params)) return false;
+  if (!cv::imencode(".jpg", *out, encoded, params)) return false;
   add_sample(&state->encode, ms_since(encode_start));
 
   std::string header =
-      json_header(stream_name, msg, cfg.out_width, cfg.out_height,
-                  encoded.size());
+      json_header(stream_name, msg, out->cols, out->rows, encoded.size());
   pub.send(zmq::buffer(stream_name, std::strlen(stream_name)),
            zmq::send_flags::sndmore);
   pub.send(zmq::buffer(header), zmq::send_flags::sndmore);
   pub.send(zmq::buffer(encoded.data(), encoded.size()), zmq::send_flags::none);
+  ++state->publish_count;
+  return true;
+}
+
+// Forward an already-compressed (jpg) payload to the TCP stream unchanged.
+bool publish_compressed(zmq::socket_t& pub, const char* stream_name,
+                        const mgx10v::proto::RawImage& msg,
+                        const void* data, size_t size, ImageState* state) {
+  std::string header = json_header(stream_name, msg,
+                                   static_cast<int>(msg.width()),
+                                   static_cast<int>(msg.height()), size);
+  pub.send(zmq::buffer(stream_name, std::strlen(stream_name)),
+           zmq::send_flags::sndmore);
+  pub.send(zmq::buffer(header), zmq::send_flags::sndmore);
+  pub.send(zmq::buffer(data, size), zmq::send_flags::none);
   ++state->publish_count;
   return true;
 }
@@ -364,21 +441,41 @@ bool handle_image(const char* stream_name, const zmq::message_t& payload,
   if (!msg.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
     return false;
   }
-  cv::Mat image;
-  const void* raw_data = raw_payload ? raw_payload->data() : nullptr;
-  const size_t raw_size = raw_payload ? raw_payload->size() : 0;
-  if (!raw_image_to_mat(msg, raw_data, raw_size, &image) || image.empty()) {
-    return false;
-  }
-
-  cv::Mat bgr;
-  if (!mat_to_bgr(msg, image, &bgr) || bgr.empty()) return false;
-  state->latest_bgr = bgr.clone();
   state->latest_sec = msg.timestamp().seconds();
   state->latest_nsec = msg.timestamp().nanos();
   state->latest_width = msg.width();
   state->latest_height = msg.height();
   state->latest_encoding = msg.encoding();
+
+  const void* raw_data = raw_payload ? raw_payload->data() : nullptr;
+  size_t raw_size = raw_payload ? raw_payload->size() : 0;
+  if (!raw_data && !msg.data().empty()) {
+    raw_data = msg.data().data();
+    raw_size = msg.data().size();
+  }
+
+  const std::string& enc = msg.encoding();
+  if (enc == "jpg" || enc == "jpeg") {
+    // Compressed upstream: decode to BGR (for the PNG snapshot) and forward the
+    // original bytes to the preview stream unchanged (no re-encode).
+    if (!raw_data || raw_size == 0) return false;
+    cv::Mat enc_buf(1, static_cast<int>(raw_size), CV_8UC1,
+                    const_cast<void*>(raw_data));
+    state->latest_bgr = cv::imdecode(enc_buf, cv::IMREAD_COLOR);
+    if (state->latest_bgr.empty()) return false;
+    add_sample(&state->decode, ms_since(start));
+    return publish_compressed(image_pub, stream_name, msg, raw_data, raw_size,
+                              state);
+  }
+
+  // Raw/NV12 transport: decode -> BGR for both the preview stream and PNG save.
+  cv::Mat image;
+  if (!raw_image_to_mat(msg, raw_data, raw_size, &image) || image.empty()) {
+    return false;
+  }
+  cv::Mat bgr;
+  if (!mat_to_bgr(msg, image, &bgr) || bgr.empty()) return false;
+  state->latest_bgr = bgr.clone();
   add_sample(&state->decode, ms_since(start));
 
   return publish_resized_jpeg(image_pub, stream_name, msg, state->latest_bgr,
@@ -408,6 +505,22 @@ void write_imu_sample(const ImuSample& sample, std::ofstream* file) {
           << sample.gx << ' ' << sample.gy << ' ' << sample.gz << '\n';
 }
 
+// Write the pair's two arrival-order IMU neighbours to <id>_imu.txt: the IMU that
+// arrived just before the image, then the one that arrived just after. Rows hold
+// each IMU's own sensor timestamp (arrival order only decides which two).
+void write_imu_pair(const std::string& save_dir, const PendingImu& p,
+                    const ImuSample* after) {
+  const std::string path = save_dir + "/" + std::to_string(p.id) + "_imu.txt";
+  std::ofstream f(path, std::ios::out);
+  if (!f.is_open()) {
+    std::fprintf(stderr, "failed to write imu file: %s\n", path.c_str());
+    return;
+  }
+  f << "ts ax ay az gx gy gz\n";
+  if (p.has_before) write_imu_sample(p.before, &f);
+  if (after) write_imu_sample(*after, &f);
+}
+
 int next_save_id(const std::string& save_dir) {
   const std::string path = save_dir + "/image_timestamps.txt";
   std::ifstream in(path);
@@ -435,15 +548,26 @@ bool append_image_timestamp(const std::string& map_path, int id,
   return true;
 }
 
+bool state_has_image(const ImageState& s) {
+  return !s.latest_bgr.empty();
+}
+
+// Write one camera's latest frame as a lossless PNG of the decoded BGR.
+bool write_image_file(const std::string& dir, const std::string& base,
+                      const ImageState& s, std::string* out_name) {
+  *out_name = base + ".png";
+  return cv::imwrite(dir + "/" + *out_name, s.latest_bgr);
+}
+
 bool start_save_job(const Config& cfg, const ImageState& left,
                     const ImageState& right,
-                    int* next_id, std::deque<SaveJob>* jobs,
-                    std::string* reply) {
-  if (left.latest_bgr.empty()) {
+                    int* next_id, std::deque<PendingImu>* pending,
+                    const ImuSample* before, std::string* reply) {
+  if (!state_has_image(left)) {
     *reply = "ERR no left image received yet";
     return false;
   }
-  if (right.latest_bgr.empty()) {
+  if (!state_has_image(right)) {
     *reply = "ERR no right image received yet";
     return false;
   }
@@ -455,13 +579,15 @@ bool start_save_job(const Config& cfg, const ImageState& left,
   }
 
   const int id = (*next_id)++;
-  const std::string left_name = std::to_string(id) + "_left.png";
-  const std::string right_name = std::to_string(id) + "_right.png";
-  if (!cv::imwrite(left_dir + "/" + left_name, left.latest_bgr)) {
+  std::string left_name;
+  std::string right_name;
+  if (!write_image_file(left_dir, std::to_string(id) + "_left", left,
+                        &left_name)) {
     *reply = "ERR failed to write left image";
     return false;
   }
-  if (!cv::imwrite(right_dir + "/" + right_name, right.latest_bgr)) {
+  if (!write_image_file(right_dir, std::to_string(id) + "_right", right,
+                        &right_name)) {
     *reply = "ERR failed to write right image";
     return false;
   }
@@ -475,35 +601,20 @@ bool start_save_job(const Config& cfg, const ImageState& left,
     return false;
   }
 
-  SaveJob job;
-  job.id = id;
-  job.end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  const std::string imu_path = cfg.save_dir + "/" + std::to_string(id) +
-                               "_imu.txt";
-  job.imu_file.open(imu_path, std::ios::out);
-  if (!job.imu_file.is_open()) {
-    *reply = "ERR failed to write imu file";
-    return false;
-  }
-  job.imu_file << "ts ax ay az gx gy gz\n";
-  jobs->push_back(std::move(job));
+  // Record the IMU that arrived just before this image now; the next IMU to
+  // arrive becomes the "after" neighbour and completes the file (see main loop).
+  PendingImu p;
+  p.id = id;
+  if (before) { p.before = *before; p.has_before = true; }
+  pending->push_back(p);
 
   std::ostringstream os;
   os << "OK saved " << left_name << " ts="
      << ts_string(left.latest_sec, left.latest_nsec) << " and "
      << right_name << " ts=" << ts_string(right.latest_sec, right.latest_nsec)
-     << " recording imu 3s";
+     << " imu prev+next";
   *reply = os.str();
   return true;
-}
-
-void finish_expired_jobs(std::deque<SaveJob>* jobs) {
-  const auto now = std::chrono::steady_clock::now();
-  while (!jobs->empty() && now >= jobs->front().end_time) {
-    jobs->front().imu_file.flush();
-    jobs->front().imu_file.close();
-    jobs->pop_front();
-  }
 }
 
 void print_stats(const char* name, ImageState* state, double interval_s,
@@ -548,6 +659,7 @@ int main(int argc, char** argv) {
   zmq::socket_t sub(context, zmq::socket_type::sub);
   sub.set(zmq::sockopt::linger, 0);
   sub.set(zmq::sockopt::rcvhwm, 20);
+  sub.set(zmq::sockopt::rcvtimeo, 200);  // so the receiver thread can poll g_run
   sub.connect(cfg.cam_left_endpoint);
   sub.connect(cfg.cam_right_endpoint);
   sub.connect(cfg.imu_endpoint);
@@ -581,10 +693,63 @@ int main(int argc, char** argv) {
   uint64_t bad_topic = 0;
   uint64_t decode_fail = 0;
   uint64_t command_count = 0;
-  std::deque<SaveJob> save_jobs;
+  std::deque<PendingImu> pending_imu;  // saved pairs awaiting their "after" IMU
+  ImuSample prev_imu;                  // most recently arrived IMU ("before")
+  bool have_prev_imu = false;
+  int pending_burst = 0;      // remaining stereo pairs to capture for the active 's'
+  int64_t last_saved_ns = 0;  // ts of the last saved pair (monotonic guard)
 
   const auto start = std::chrono::steady_clock::now();
   auto last_print = start;
+
+  // Receiver thread: drain the SUB socket as fast as messages arrive so a
+  // backlog never builds there. That keeps ZMQ from fair-queueing a backlog
+  // across the cam/cam/imu connections (which collapses the real ~5-IMU-per-pair
+  // interleaving to ~1) -- the queue below preserves true arrival order, which
+  // the before/after IMU selection depends on. Any backlog moves here instead.
+  std::deque<QMsg> rx_queue;
+  std::mutex rx_mtx;
+  uint64_t rx_dropped = 0;
+  std::thread rx_thread([&]() {
+    while (g_run.load()) {
+      QMsg m;
+      if (!recv_multipart(sub, &m.topic, &m.payload, &m.raw, &m.has_raw)) {
+        continue;  // RCVTIMEO/error: re-check g_run
+      }
+      std::lock_guard<std::mutex> lk(rx_mtx);
+      rx_queue.push_back(std::move(m));
+      while (rx_queue.size() > kRecvQueueMax) {
+        rx_queue.pop_front();
+        ++rx_dropped;
+      }
+    }
+  });
+
+  // Save one timestamp-matched stereo pair per burst step. Called after every
+  // camera frame, so it fires the moment the matching half arrives regardless of
+  // left/right arrival order -- fixing the old "latest-left + latest-right"
+  // pairing that grouped frames ~2 apart.
+  auto try_capture = [&]() {
+    if (pending_burst <= 0 || !state_has_image(left) || !state_has_image(right))
+      return;
+    const int64_t lns = frame_ns(left);
+    if (!stereo_pair_ready(lns, frame_ns(right), last_saved_ns,
+                           kStereoPairToleranceNs))
+      return;
+    std::string r;
+    if (start_save_job(cfg, left, right, &next_id, &pending_imu,
+                       have_prev_imu ? &prev_imu : nullptr, &r)) {
+      last_saved_ns = lns;
+      --pending_burst;
+      if (!cfg.quiet) {
+        std::printf("[save %d/%d] %s\n", cfg.save_count - pending_burst,
+                    cfg.save_count, r.c_str());
+      }
+    } else {
+      pending_burst = 0;
+      std::printf("[save] burst aborted: %s\n", r.c_str());
+    }
+  };
 
   while (g_run.load()) {
     if (cfg.duration_sec > 0 &&
@@ -594,49 +759,11 @@ int main(int argc, char** argv) {
       break;
     }
 
-    zmq::pollitem_t items[] = {
-        {sub.handle(), 0, ZMQ_POLLIN, 0},
-        {control.handle(), 0, ZMQ_POLLIN, 0},
-    };
-    zmq::poll(items, 2, std::chrono::milliseconds(50));
-
-    if (items[0].revents & ZMQ_POLLIN) {
-      std::string topic;
-      zmq::message_t payload;
-      zmq::message_t raw_payload;
-      bool has_raw_payload = false;
-      if (!recv_multipart(sub, &topic, &payload, &raw_payload,
-                          &has_raw_payload)) {
-        ++decode_fail;
-      } else if (topic == cfg.cam_left_topic) {
-        if (!handle_image("cam_left", payload,
-                          has_raw_payload ? &raw_payload : nullptr,
-                          cfg, image_pub, &left)) {
-          ++decode_fail;
-        }
-      } else if (topic == cfg.cam_right_topic) {
-        if (!handle_image("cam_right", payload,
-                          has_raw_payload ? &raw_payload : nullptr,
-                          cfg, image_pub, &right)) {
-          ++decode_fail;
-        }
-      } else if (topic == cfg.imu_topic) {
-        ImuSample sample;
-        auto imu_start = std::chrono::steady_clock::now();
-        if (decode_imu(payload, &sample)) {
-          add_sample(&imu_stats, ms_since(imu_start));
-          for (auto& job : save_jobs) {
-            write_imu_sample(sample, &job.imu_file);
-          }
-        } else {
-          ++decode_fail;
-        }
-      } else {
-        ++bad_topic;
-      }
-    }
-
-    if (items[1].revents & ZMQ_POLLIN) {
+    // Control socket: short poll so command latency stays low while the main
+    // work is servicing the receiver queue.
+    zmq::pollitem_t citems[] = {{control.handle(), 0, ZMQ_POLLIN, 0}};
+    zmq::poll(citems, 1, std::chrono::milliseconds(10));
+    if (citems[0].revents & ZMQ_POLLIN) {
       zmq::message_t request;
       auto ret = control.recv(request, zmq::recv_flags::none);
       std::string reply = "ERR empty command";
@@ -645,8 +772,13 @@ int main(int argc, char** argv) {
                         request.size());
         if (cmd == "s" || cmd == "save" || cmd.find("\"save\"") != std::string::npos) {
           ++command_count;
-          (void)start_save_job(cfg, left, right, &next_id, &save_jobs,
-                               &reply);
+          if (!state_has_image(left) || !state_has_image(right)) {
+            reply = "ERR no stereo frame received yet";
+          } else {
+            pending_burst = cfg.save_count;
+            reply = "OK capturing " + std::to_string(cfg.save_count) +
+                    " stereo pairs";
+          }
         } else {
           reply = "ERR unknown command";
         }
@@ -655,7 +787,47 @@ int main(int argc, char** argv) {
       if (!cfg.quiet) std::printf("[control] %s\n", reply.c_str());
     }
 
-    finish_expired_jobs(&save_jobs);
+    // Drain everything the receiver thread queued, in true arrival order.
+    std::deque<QMsg> batch;
+    {
+      std::lock_guard<std::mutex> lk(rx_mtx);
+      batch.swap(rx_queue);
+    }
+    for (auto& m : batch) {
+      if (m.topic == cfg.cam_left_topic) {
+        if (!handle_image("cam_left", m.payload, m.has_raw ? &m.raw : nullptr,
+                          cfg, image_pub, &left)) {
+          ++decode_fail;
+        } else {
+          try_capture();
+        }
+      } else if (m.topic == cfg.cam_right_topic) {
+        if (!handle_image("cam_right", m.payload, m.has_raw ? &m.raw : nullptr,
+                          cfg, image_pub, &right)) {
+          ++decode_fail;
+        } else {
+          try_capture();
+        }
+      } else if (m.topic == cfg.imu_topic) {
+        ImuSample sample;
+        auto imu_start = std::chrono::steady_clock::now();
+        if (decode_imu(m.payload, &sample)) {
+          add_sample(&imu_stats, ms_since(imu_start));
+          // This newly-arrived IMU is the "after" neighbour for every image that
+          // arrived since the previous IMU; write their files and clear them.
+          for (const auto& p : pending_imu) {
+            write_imu_pair(cfg.save_dir, p, &sample);
+          }
+          pending_imu.clear();
+          prev_imu = sample;       // becomes the "before" for later images
+          have_prev_imu = true;
+        } else {
+          ++decode_fail;
+        }
+      } else {
+        ++bad_topic;
+      }
+    }
 
     const auto now = std::chrono::steady_clock::now();
     const double interval_ms =
@@ -664,12 +836,15 @@ int main(int argc, char** argv) {
       const double interval_s = interval_ms / 1000.0;
       const double elapsed_s =
           std::chrono::duration<double>(now - start).count();
+      uint64_t dropped;
+      { std::lock_guard<std::mutex> lk(rx_mtx); dropped = rx_dropped; }
       std::printf("\n[stat] elapsed=%.3fs decode_fail=%llu bad_topic=%llu "
-                  "imu=%llu active_save_jobs=%zu commands=%llu\n",
+                  "imu=%llu pending_imu=%zu rx_dropped=%llu commands=%llu\n",
                   elapsed_s, static_cast<unsigned long long>(decode_fail),
                   static_cast<unsigned long long>(bad_topic),
                   static_cast<unsigned long long>(imu_stats.count),
-                  save_jobs.size(),
+                  pending_imu.size(),
+                  static_cast<unsigned long long>(dropped),
                   static_cast<unsigned long long>(command_count));
       print_stats("cam_left", &left, interval_s, elapsed_s);
       print_stats("cam_right", &right, interval_s, elapsed_s);
@@ -678,9 +853,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  for (auto& job : save_jobs) {
-    job.imu_file.flush();
-    job.imu_file.close();
+  g_run.store(false);
+  rx_thread.join();
+
+  // Flush any pairs that never received an "after" IMU: write the before only.
+  for (const auto& p : pending_imu) {
+    write_imu_pair(cfg.save_dir, p, nullptr);
   }
 
   std::printf("done. left=%llu right=%llu imu=%llu decode_fail=%llu "

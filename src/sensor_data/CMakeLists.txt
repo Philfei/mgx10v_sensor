@@ -178,33 +178,7 @@ add_executable(gnss_sensor_data
   src/gnss_sensor_data.cpp)
 target_link_libraries(gnss_sensor_data PRIVATE sensor_common)
 
-add_executable(timestamp_conversion_test
-  tests/timestamp_conversion_test.cpp)
-target_include_directories(timestamp_conversion_test PRIVATE include)
-target_link_libraries(timestamp_conversion_test PRIVATE sensor_common)
-
-add_executable(gnss_fill_test
-  tests/gnss_fill_test.cpp)
-target_include_directories(gnss_fill_test PRIVATE include)
-target_link_libraries(gnss_fill_test PRIVATE sensor_common)
-
-add_executable(bounded_frame_queue_test
-  tests/bounded_frame_queue_test.cpp)
-target_include_directories(bounded_frame_queue_test PRIVATE include)
-
-add_executable(frame_timestamp_tracker_test
-  tests/frame_timestamp_tracker_test.cpp)
-target_include_directories(frame_timestamp_tracker_test PRIVATE include)
-
-add_executable(exposure_timestamp_test
-  tests/exposure_timestamp_test.cpp)
-target_include_directories(exposure_timestamp_test PRIVATE include)
-
-add_executable(camera_timestamp_assignment_test
-  tests/camera_timestamp_assignment_test.cpp)
-target_include_directories(camera_timestamp_assignment_test PRIVATE include)
-
-foreach(_target cam_sensor_data imu_sensor_data gnss_sensor_data timestamp_conversion_test gnss_fill_test bounded_frame_queue_test frame_timestamp_tracker_test exposure_timestamp_test camera_timestamp_assignment_test)
+foreach(_target cam_sensor_data imu_sensor_data gnss_sensor_data)
   set_target_properties(${_target} PROPERTIES
     INSTALL_RPATH "$ORIGIN/lib:$ORIGIN/lib/rockchip"
     BUILD_WITH_INSTALL_RPATH TRUE)

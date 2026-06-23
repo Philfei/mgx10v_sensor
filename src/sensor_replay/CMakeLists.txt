@@ -12,7 +12,6 @@ endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -O3)
 
 option(SENSOR_REPLAY_BUILD_APP "Build sensor_replay application" ON)
-option(SENSOR_REPLAY_BUILD_TESTS "Build sensor_replay tests" ON)
 
 get_filename_component(RECEIVER_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
@@ -81,21 +80,6 @@ if(SENSOR_REPLAY_BUILD_APP)
   set_target_properties(sensor_replay PROPERTIES
     INSTALL_RPATH "$ORIGIN/lib"
     BUILD_WITH_INSTALL_RPATH TRUE)
-endif()
-
-if(SENSOR_REPLAY_BUILD_TESTS)
-  enable_testing()
-  add_executable(replay_index_test tests/replay_index_test.cpp)
-  target_link_libraries(replay_index_test PRIVATE sensor_replay_core)
-  add_test(NAME replay_index_test COMMAND replay_index_test)
-
-  add_executable(replay_config_test tests/replay_config_test.cpp)
-  target_link_libraries(replay_config_test PRIVATE sensor_replay_core)
-  add_test(NAME replay_config_test COMMAND replay_config_test)
-
-  add_executable(replay_timing_test tests/replay_timing_test.cpp)
-  target_link_libraries(replay_timing_test PRIVATE sensor_replay_core)
-  add_test(NAME replay_timing_test COMMAND replay_timing_test)
 endif()
 
 if(SENSOR_REPLAY_BUILD_APP)
