@@ -5,6 +5,7 @@
 
 #include "RawImageMsg.pb.h"
 
+#include <im2d.h>
 #include <linux/videodev2.h>
 #include <rk_aiq_user_api2_sysctl.h>
 #include <rk_defines.h>
@@ -65,7 +66,48 @@ struct Args {
   int duration_s = 0;
   bool aiq = true;
   std::string iq_dir = "/etc/iqfiles/";
+  std::string color_format = "bgr8";
 };
+
+// Output image format. "nv12" (default) publishes the raw NV12 buffer with no
+// conversion; "bgr8"/"bgra8" run an RGA hardware color convert (NV12 -> BGR).
+struct ColorFormatInfo {
+  const char* encoding = "nv12";
+  bool use_rga = false;  // false => publish raw NV12, no conversion
+  int channels = 3;
+  int rga_format = RK_FORMAT_BGR_888;
+};
+
+std::string lower_copy(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return s;
+}
+
+bool parse_color_format(const std::string& value, ColorFormatInfo* out) {
+  if (!out) return false;
+  const std::string v = lower_copy(value);
+  if (v == "nv12") {
+    *out = ColorFormatInfo{};
+    return true;
+  }
+  if (v == "bgr8") {
+    out->encoding = "bgr8";
+    out->use_rga = true;
+    out->channels = 3;
+    out->rga_format = RK_FORMAT_BGR_888;
+    return true;
+  }
+  if (v == "bgra8") {
+    out->encoding = "bgra8";
+    out->use_rga = true;
+    out->channels = 4;
+    out->rga_format = RK_FORMAT_BGRA_8888;
+    return true;
+  }
+  return false;
+}
 
 void on_signal(int) {
   g_run.store(false);
@@ -89,7 +131,8 @@ void usage(const char* app) {
       "  --right-endpoint <ipc://>  default ipc:///tmp/cam_right\n"
       "  --left-topic <topic>       default cam_left_topic\n"
       "  --right-topic <topic>      default cam_right_topic\n"
-      "  (publishes raw NV12: encoding=nv12, step=width, data=w*h*3/2)\n",
+      "  --color-format <fmt>       bgr8 (default, RGA convert) | bgra8 | nv12 (raw)\n"
+      "  (bgr8/bgra8 via RGA; nv12: encoding=nv12, step=width, data=w*h*3/2)\n",
       app);
 }
 
@@ -120,6 +163,7 @@ bool parse_args(int argc, char** argv, Args& args) {
     else if (key == "--right-endpoint") args.right_endpoint = next();
     else if (key == "--left-topic") args.left_topic = next();
     else if (key == "--right-topic") args.right_topic = next();
+    else if (key == "--color-format") args.color_format = next();
     else if (key == "-h" || key == "--help") {
       usage(argv[0]);
       return false;
@@ -712,6 +756,109 @@ bool publish_nv12_image(ZmqPublisher& pub, const Frame& frame,
   return pub.publish_with_raw_payload(msg, frame.data.data(), expected);
 }
 
+struct ConvertedImage {
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+  const char* encoding = "bgr8";
+  uint32_t step = 0;
+};
+
+// RGA hardware color convert: NV12 -> BGR/BGRA. Output buffer is reused across
+// frames. Only used when --color-format is bgr8/bgra8.
+class RgaColorConverter {
+public:
+  explicit RgaColorConverter(ColorFormatInfo format) : format_(format) {}
+
+  bool convert(const Frame& frame, ConvertedImage* image) {
+    if (!image || frame.width <= 0 || frame.height <= 0 ||
+        frame.data.empty()) {
+      return false;
+    }
+    *image = ConvertedImage{};
+    image->encoding = format_.encoding;
+
+    const size_t expected_nv12 =
+        static_cast<size_t>(frame.width) * frame.height * 3 / 2;
+    if (frame.data.size() < expected_nv12) return false;
+
+    const size_t expected_color =
+        static_cast<size_t>(frame.width) * frame.height * format_.channels;
+    if (!ensure_output(frame.width, frame.height, expected_color)) {
+      return false;
+    }
+
+    rga_buffer_t src = wrapbuffer_virtualaddr(
+        const_cast<uint8_t*>(frame.data.data()), frame.width, frame.height,
+        RK_FORMAT_YCbCr_420_SP);
+    rga_buffer_t dst = wrapbuffer_virtualaddr(color_.data(), frame.width,
+                                              frame.height,
+                                              format_.rga_format);
+
+    IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP,
+                                  format_.rga_format,
+                                  IM_YUV_TO_RGB_BT601_FULL, 1);
+    if (status != IM_STATUS_SUCCESS) {
+      static std::atomic<unsigned int> log_count{0};
+      unsigned int n = log_count.fetch_add(1);
+      if (n < 5 || n % 100 == 0) {
+        std::fprintf(stderr, "rga imcvtcolor failed: %s (%d)\n",
+                     imStrError(status), static_cast<int>(status));
+      }
+      return false;
+    }
+
+    image->data = color_.data();
+    image->size = expected_color;
+    image->step = static_cast<uint32_t>(frame.width * format_.channels);
+    return true;
+  }
+
+private:
+  bool ensure_output(int width, int height, size_t size) {
+    if (width == dst_width_ && height == dst_height_ && size == dst_size_ &&
+        dst_ready_) {
+      return true;
+    }
+    dst_width_ = width;
+    dst_height_ = height;
+    dst_size_ = size;
+    color_.assign(size, 0);
+    dst_ready_ = true;
+    return true;
+  }
+
+  ColorFormatInfo format_;
+  std::vector<uint8_t> color_;
+  int dst_width_ = 0;
+  int dst_height_ = 0;
+  size_t dst_size_ = 0;
+  bool dst_ready_ = false;
+};
+
+bool publish_color_image(ZmqPublisher& pub, const Frame& frame,
+                         const ConvertedImage& image,
+                         const std::string& frame_id) {
+  if (!image.data || frame.width <= 0 || frame.height <= 0 ||
+      image.step == 0) {
+    return false;
+  }
+  const size_t expected = static_cast<size_t>(image.step) * frame.height;
+  if (image.size < expected) return false;
+
+  mgx10v::proto::RawImage msg;
+  msg.Clear();
+  set_timestamp_from_ns(msg.mutable_timestamp(), frame.ts_ns);
+  msg.set_frame_id(frame_id);
+  msg.set_width(static_cast<uint32_t>(frame.width));
+  msg.set_height(static_cast<uint32_t>(frame.height));
+  msg.set_encoding(image.encoding);
+  msg.set_step(image.step);
+  msg.set_data_size(static_cast<uint64_t>(expected));
+  msg.set_exposure_us(static_cast<uint32_t>(std::max(frame.exposure_us, 0)));
+
+  return pub.publish_with_raw_payload(msg, image.data, expected);
+}
+
 double fps_from_count(unsigned long long count, double elapsed_s) {
   return elapsed_s > 0.0 ? static_cast<double>(count) / elapsed_s : 0.0;
 }
@@ -736,6 +883,15 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+
+  ColorFormatInfo color_format;
+  if (!parse_color_format(args.color_format, &color_format)) {
+    std::fprintf(stderr,
+                 "cam_sensor_data: invalid --color-format '%s' "
+                 "(use nv12 | bgr8 | bgra8)\n",
+                 args.color_format.c_str());
+    return 1;
+  }
 
   zmq::context_t zmq_context(1);
   ZmqPublisher left_pub(zmq_context, args.left_endpoint, args.left_topic);
@@ -772,6 +928,7 @@ int main(int argc, char** argv) {
   BoundedFrameQueue<CapturedFrame> right_queue(kPublishQueueDepth);
 
   auto handle_frame = [&](std::shared_ptr<Frame> frame,
+                          RgaColorConverter& converter,
                           ZmqPublisher& publisher,
                           const std::string& frame_id,
                           std::atomic<unsigned long long>& frame_count) {
@@ -781,7 +938,17 @@ int main(int argc, char** argv) {
     }
 
     auto publish_start = std::chrono::steady_clock::now();
-    bool published = publish_nv12_image(publisher, *frame, frame_id);
+    bool published;
+    if (color_format.use_rga) {
+      ConvertedImage image;
+      if (!converter.convert(*frame, &image)) {
+        ++decode_fail_count;
+        return;
+      }
+      published = publish_color_image(publisher, *frame, image, frame_id);
+    } else {
+      published = publish_nv12_image(publisher, *frame, frame_id);
+    }
     uint64_t publish_us = elapsed_us_since(publish_start);
     ++published_count;
     publish_total_us.fetch_add(publish_us);
@@ -797,6 +964,7 @@ int main(int argc, char** argv) {
   };
 
   auto publish_loop = [&](BoundedFrameQueue<CapturedFrame>& queue,
+                          RgaColorConverter& converter,
                           ZmqPublisher& publisher,
                           const std::string& frame_id,
                           std::atomic<unsigned long long>& frame_count) {
@@ -808,15 +976,21 @@ int main(int argc, char** argv) {
         ++decode_fail_count;
         continue;
       }
-      handle_frame(std::move(frame), publisher, frame_id, frame_count);
+      handle_frame(std::move(frame), converter, publisher, frame_id,
+                   frame_count);
     }
   };
 
+  RgaColorConverter left_converter(color_format);
+  RgaColorConverter right_converter(color_format);
+
   std::thread left_publish_thread([&] {
-    publish_loop(left_queue, left_pub, args.left_frame_id, left_count);
+    publish_loop(left_queue, left_converter, left_pub, args.left_frame_id,
+                 left_count);
   });
   std::thread right_publish_thread([&] {
-    publish_loop(right_queue, right_pub, args.right_frame_id, right_count);
+    publish_loop(right_queue, right_converter, right_pub, args.right_frame_id,
+                 right_count);
   });
 
   if (!capture.start([&](CapturedFrame frame) {
@@ -843,7 +1017,9 @@ int main(int argc, char** argv) {
   std::printf("  requested MPI capture: %dx%d fps %d rkaiq=%s left_dev=%d right_dev=%d\n",
               args.width, args.height, args.fps, args.aiq ? "on" : "off",
               capture.left_dev(), capture.right_dev());
-  std::printf("  image transport: raw NV12 (encoding=nv12, no RGA/JPEG)\n");
+  std::printf("  image transport: %s (%s)\n", color_format.encoding,
+              color_format.use_rga ? "RGA NV12->color convert"
+                                   : "raw NV12, no RGA/JPEG");
   std::printf("  actual capture: L=%dx%d R=%dx%d\n",
               capture.width(), capture.height(), capture.width(),
               capture.height());

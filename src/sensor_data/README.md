@@ -40,10 +40,14 @@ part 2: 原始图像 bytes
 该目录生成 C++ protobuf 代码，构建输出也会复制 `proto/`，便于部署后查看消息
 结构。
 
-`cam_sensor_data` 直接发布相机原生 **NV12**（`encoding="nv12"`，`step=width`，
-payload = 紧凑 NV12 `w*h*3/2` 字节），**不做** RGA 颜色转换、**不做** JPEG 编码——
-sensor_data 端最省 CPU、无损。下游解码即得彩色图：NV12 的 Y 平面就是全分辨率灰度
-（IC-GVINS 等可零拷贝取 Y），`cv2.cvtColor(..., COLOR_YUV2BGR_NV12)` 得 BGR。
+`cam_sensor_data` 默认发布 **bgr8**（`encoding="bgr8"`，`step=width*3`），由 RGA
+硬件把相机原生 NV12 转换为 BGR 后通过三段 ZMQ 发布。可用 `--color-format` 切换：
+
+- `bgr8`（默认）：RGA NV12→BGR，3 通道，`step=width*3`。
+- `bgra8`：RGA NV12→BGRA，4 通道，32bit 对齐。
+- `nv12`：直接发布相机原生 NV12（`step=width`，payload `w*h*3/2`），不做 RGA/JPEG，
+  最省 CPU、无损；Y 平面即全分辨率灰度（IC-GVINS 可零拷贝取 Y），
+  `cv2.cvtColor(..., COLOR_YUV2BGR_NV12)` 得 BGR。
 
 `cam_sensor_data` 采集 `nv12`（`RK_FMT_YUV420SP`），把 VPSS 帧按行 stride 紧凑拷贝
 为 `stride=width` 的 NV12 缓冲后,通过三段 ZMQ（topic / RawImage header / 原始 NV12
